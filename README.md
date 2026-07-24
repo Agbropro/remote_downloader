@@ -43,6 +43,7 @@ Edit argumen di `download.sh`:
 --path /remote/path     # direktori remote
 --output ~/local/path   # direktori tujuan lokal
 --workers 8             # jumlah koneksi paralel
+--scan-workers 4        # jumlah koneksi untuk scan direktori
 ```
 
 Untuk autentikasi password, pertahankan `--password`. Jika ingin memakai SSH key, hapus `--password` dan tambahkan `--key /path/to/private_key`.
@@ -61,6 +62,10 @@ Tambahkan `--password` agar program meminta password secara interaktif.
 
 ## Perilaku download
 
-Downloader mempertahankan struktur folder dari direktori remote dan melewati file lokal yang ukurannya sudah sama dengan file remote. Hasil dan kegagalan ditampilkan di terminal setelah proses selesai.
+Downloader mempertahankan struktur folder dari direktori remote dan melewati file lokal yang ukurannya sudah sama dengan file remote. Scan direktori dan download dijalankan secara paralel menggunakan koneksi SFTP yang dipakai ulang oleh setiap worker.
+
+Download yang belum selesai disimpan dengan ekstensi `.part` dan dilanjutkan saat perintah dijalankan kembali. Tekan `Ctrl+C` untuk membatalkan proses; file parsial tetap disimpan agar dapat dilanjutkan.
+
+Untuk mencari konfigurasi tercepat, coba `--workers` antara 4–16 dan `--scan-workers` antara 2–4. Terlalu banyak koneksi dapat membuat server lebih lambat atau mencapai batas koneksi SSH.
 
 > Catatan: program saat ini menerima host key SSH yang belum dikenal secara otomatis. Pastikan hostname/IP server benar sebelum memasukkan password.

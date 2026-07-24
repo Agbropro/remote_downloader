@@ -1,2 +1,2 @@
-paramiko
-tqdm
+paramiko>=3.3
+tqdm>=4.0

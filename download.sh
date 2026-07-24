@@ -16,4 +16,5 @@ exec "$venv_python" "$script_dir/ssh_download.py" \
   --path /home/nusapala/program/cv/cv-screening/data/2026-07-24 \
   --output ~/cv_screening_test_date \
   --password nusapala01 \
-  --workers 8
+  --workers 8 \
+  --scan-workers 4
