@@ -42,8 +42,11 @@ Edit argumen di `download.sh`:
 --user nusapala         # username SSH
 --path /remote/path     # direktori remote
 --output ~/local/path   # direktori tujuan lokal
---workers 8             # jumlah koneksi paralel
+--workers 4             # jumlah koneksi paralel
 --scan-workers 4        # jumlah koneksi untuk scan direktori
+--prefetch-requests 16  # request SFTP aktif per worker
+--request-size 32768    # ukuran setiap request baca dalam byte
+--retries 3             # percobaan maksimal untuk setiap file
 ```
 
 Untuk autentikasi password, pertahankan `--password`. Jika ingin memakai SSH key, hapus `--password` dan tambahkan `--key /path/to/private_key`.
@@ -55,7 +58,7 @@ Alternatif tanpa `download.sh`:
 ```bash
 /opt/personal/.personal-venv/bin/python ssh_download.py \
   --host SERVER --user USER --path /remote/path --output ./downloaded-files \
-  --workers 8
+  --workers 4 --prefetch-requests 16 --request-size 32768
 ```
 
 Tambahkan `--password` agar program meminta password secara interaktif.
@@ -66,6 +69,18 @@ Downloader mempertahankan struktur folder dari direktori remote dan melewati fil
 
 Download yang belum selesai disimpan dengan ekstensi `.part` dan dilanjutkan saat perintah dijalankan kembali. Tekan `Ctrl+C` untuk membatalkan proses; file parsial tetap disimpan agar dapat dilanjutkan.
 
-Untuk mencari konfigurasi tercepat, coba `--workers` antara 4–16 dan `--scan-workers` antara 2–4. Terlalu banyak koneksi dapat membuat server lebih lambat atau mencapai batas koneksi SSH.
+Konfigurasi utama tersedia di bagian atas `download.sh`:
+
+```bash
+WORKERS="4"
+SCAN_WORKERS="4"
+PREFETCH_REQUESTS="16"
+REQUEST_SIZE="32768"
+RETRIES="3"
+```
+
+`PREFETCH_REQUESTS` adalah jumlah request baca SFTP yang dapat aktif bersamaan untuk setiap worker. `REQUEST_SIZE` adalah ukuran setiap request dalam byte dan dibatasi maksimal 32768 untuk kompatibilitas dengan server SFTP. Nilai awal yang disarankan adalah 4 worker, 16 request per worker, dan request size 32768 byte. Ubah satu nilai pada satu waktu sambil membandingkan waktu dan jumlah kegagalan; terlalu banyak koneksi atau request dapat membebani server.
+
+Jika satu tanggal masih memiliki file gagal setelah seluruh retry, `download.sh` mencatat kegagalan tersebut dan melanjutkan ke tanggal berikutnya. Setelah semua tanggal diproses, skrip keluar dengan status gagal apabila masih ada tanggal yang belum selesai sepenuhnya.
 
 > Catatan: program saat ini menerima host key SSH yang belum dikenal secara otomatis. Pastikan hostname/IP server benar sebelum memasukkan password.

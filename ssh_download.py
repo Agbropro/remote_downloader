@@ -8,6 +8,7 @@ import posixpath
 import stat
 import sys
 import threading
+import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from getpass import getpass
 from pathlib import Path
@@ -21,6 +22,23 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("paramiko").setLevel(logging.WARNING)
+
+
+def positive_int(value):
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def sftp_request_size(value):
+    parsed = positive_int(value)
+    if parsed > 32768:
+        raise argparse.ArgumentTypeError(
+            "must not exceed Paramiko's safe SFTP maximum of 32768 bytes"
+        )
+    return parsed
 
 
 class _ThreadLocalSFTP:
@@ -53,6 +71,11 @@ class _ThreadLocalSFTP:
     def close_current(self):
         resource = getattr(self.local, "resource", None)
         if resource is not None:
+            with self.lock:
+                try:
+                    self.resources.remove(resource)
+                except ValueError:
+                    pass
             self._close(resource)
             del self.local.resource
 
@@ -86,6 +109,10 @@ class SSHFileDownloader:
         key_file=None,
         num_workers=8,
         scan_workers=4,
+        prefetch_requests=16,
+        request_size=32768,
+        retries=3,
+        retry_delay=2.0,
     ):
         self.hostname = hostname
         self.username = username
@@ -94,6 +121,10 @@ class SSHFileDownloader:
         self.key_file = key_file
         self.num_workers = max(1, num_workers)
         self.scan_workers = max(1, min(scan_workers, self.num_workers))
+        self.prefetch_requests = max(1, prefetch_requests)
+        self.request_size = min(32768, max(1, request_size))
+        self.retries = max(1, retries)
+        self.retry_delay = max(0.0, retry_delay)
 
     def _create_ssh_client(self):
         client = paramiko.SSHClient()
@@ -114,6 +145,9 @@ class SSHFileDownloader:
 
         try:
             client.connect(**connect_options)
+            transport = client.get_transport()
+            if transport is not None:
+                transport.set_keepalive(30)
             return client
         except paramiko.AuthenticationException as exc:
             client.close()
@@ -208,60 +242,92 @@ class SSHFileDownloader:
         logger.info("Found %d files", len(files))
         return files
 
-    @staticmethod
-    def _download_file(sftp_pool, file_info, output_dir):
+    def _download_once(self, sftp_pool, file_info, output_dir):
         remote_path = file_info["remote_path"]
         relative_path = file_info["relative_path"]
         remote_size = file_info["size"]
         local_path = Path(output_dir) / relative_path
         partial_path = local_path.with_name(f"{local_path.name}.part")
 
-        try:
-            local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
 
-            if local_path.exists() and local_path.stat().st_size == remote_size:
-                return {"status": "skip", "file": relative_path}
+        if local_path.exists() and local_path.stat().st_size == remote_size:
+            return {"status": "skip", "file": relative_path}
 
-            offset = 0
-            if partial_path.exists():
-                partial_size = partial_path.stat().st_size
-                if partial_size < remote_size:
-                    offset = partial_size
-                elif partial_size == remote_size:
-                    os.replace(partial_path, local_path)
-                    return {"status": "success", "file": relative_path}
+        offset = 0
+        if partial_path.exists():
+            partial_size = partial_path.stat().st_size
+            if partial_size < remote_size:
+                offset = partial_size
+            elif partial_size == remote_size:
+                os.replace(partial_path, local_path)
+                return {"status": "success", "file": relative_path}
 
-            mode = "ab" if offset else "wb"
-            sftp = sftp_pool.get()
-            with sftp.open(remote_path, "rb") as remote_file:
-                if offset:
-                    remote_file.seek(offset)
-                remote_file.prefetch(
-                    file_size=remote_size,
-                    max_concurrent_requests=64,
+        mode = "ab" if offset else "wb"
+        sftp = sftp_pool.get()
+        with sftp.open(remote_path, "rb") as remote_file:
+            remote_file.MAX_REQUEST_SIZE = self.request_size
+            if offset:
+                remote_file.seek(offset)
+            remote_file.prefetch(
+                file_size=remote_size,
+                max_concurrent_requests=self.prefetch_requests,
+            )
+            with open(partial_path, mode) as local_file:
+                while True:
+                    chunk = remote_file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    local_file.write(chunk)
+
+        received_size = partial_path.stat().st_size
+        if received_size != remote_size:
+            raise OSError(
+                f"size mismatch: expected {remote_size} bytes, "
+                f"received {received_size} bytes"
+            )
+
+        os.replace(partial_path, local_path)
+        return {"status": "success", "file": relative_path}
+
+    def _download_file(self, sftp_pool, file_info, output_dir):
+        relative_path = file_info["relative_path"]
+        for attempt in range(1, self.retries + 1):
+            try:
+                return self._download_once(
+                    sftp_pool,
+                    file_info,
+                    output_dir,
                 )
-                with open(partial_path, mode) as local_file:
-                    while True:
-                        chunk = remote_file.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        local_file.write(chunk)
+            except Exception as exc:
+                sftp_pool.close_current()
+                if attempt == self.retries:
+                    return {
+                        "status": "error",
+                        "file": relative_path,
+                        "error": str(exc) or type(exc).__name__,
+                        "attempts": attempt,
+                    }
 
-            if partial_path.stat().st_size != remote_size:
-                raise OSError(
-                    f"size mismatch: expected {remote_size} bytes, "
-                    f"received {partial_path.stat().st_size} bytes"
+                delay = self.retry_delay * (2 ** (attempt - 1))
+                logger.warning(
+                    "Retrying %s after %s (attempt %d/%d, delay %.1fs)",
+                    relative_path,
+                    str(exc) or type(exc).__name__,
+                    attempt,
+                    self.retries,
+                    delay,
                 )
+                if delay:
+                    time.sleep(delay)
 
-            os.replace(partial_path, local_path)
-            return {"status": "success", "file": relative_path}
-        except Exception as exc:
-            sftp_pool.close_current()
-            return {
-                "status": "error",
-                "file": relative_path,
-                "error": str(exc),
-            }
+        # The loop always returns; this is only for static type checkers.
+        return {
+            "status": "error",
+            "file": relative_path,
+            "error": "retry loop ended unexpectedly",
+            "attempts": self.retries,
+        }
 
     def download_all(self, file_list, output_dir):
         """Download with reusable connections and a bounded future queue."""
@@ -358,15 +424,39 @@ def main():
     )
     parser.add_argument(
         "--workers",
-        type=int,
-        default=8,
-        help="Parallel download connections (default: 8)",
+        type=positive_int,
+        default=4,
+        help="Parallel download connections (default: 4)",
     )
     parser.add_argument(
         "--scan-workers",
-        type=int,
+        type=positive_int,
         default=4,
         help="Parallel scan connections (default: 4)",
+    )
+    parser.add_argument(
+        "--prefetch-requests",
+        type=positive_int,
+        default=16,
+        help="Outstanding SFTP read requests per worker (default: 16)",
+    )
+    parser.add_argument(
+        "--request-size",
+        type=sftp_request_size,
+        default=32768,
+        help="Bytes per SFTP read request, maximum 32768 (default: 32768)",
+    )
+    parser.add_argument(
+        "--retries",
+        type=positive_int,
+        default=3,
+        help="Attempts per file after transient failures (default: 3)",
+    )
+    parser.add_argument(
+        "--retry-delay",
+        type=float,
+        default=2.0,
+        help="Initial retry delay in seconds; doubles each retry (default: 2)",
     )
     args = parser.parse_args()
 
@@ -382,6 +472,10 @@ def main():
         key_file=args.key,
         num_workers=args.workers,
         scan_workers=args.scan_workers,
+        prefetch_requests=args.prefetch_requests,
+        request_size=args.request_size,
+        retries=args.retries,
+        retry_delay=args.retry_delay,
     )
 
     try:
